@@ -1,7 +1,7 @@
 // ==UserScript==
-// @name         云盘秒传工具（夸克/天翼/123/光鸭）
+// @name         云盘秒传工具（百度/夸克/天翼/123/光鸭）
 // @version      2026.04.16
-// @description  云盘秒传工具（夸克/天翼/123/光鸭）
+// @description  云盘秒传工具（百度/夸克/天翼/123/光鸭）
 // @run-at       document-idle
 // @match        https://pan.quark.cn/*
 // @match        https://drive.quark.cn/*
@@ -14,6 +14,7 @@
 // @match        https://123pan.com/*
 // @match        https://123pan.com/
 // @match        http://123pan.com/*
+// @match        https://pan.baidu.com/*
 // @match        https://guangyapan.com/*
 // @match        https://*.guangyapan.com/*
 // @grant        GM_setClipboard
@@ -26,6 +27,7 @@
 // @connect      drive-pc.quark.cn
 // @connect      pc-api.uc.cn
 // @connect      cloud.189.cn
+// @connect      pan.baidu.com
 // @connect      api.guangyapan.com
 // ==/UserScript==
 
@@ -2627,33 +2629,404 @@
         },
     };
 
-    function guangyaExtractMd5FromEtag(raw) {
-        const s = String(raw ?? "").trim();
-        if (!s) return { ok: false, reason: "etag/md5 为空" };
-        const lower = s.toLowerCase();
-        if (/^[0-9a-f]{32}$/.test(lower)) {
-            return { ok: true, md5: lower };
-        }
-        const stripped = lower.replace(/[^0-9a-f]/g, "");
-        if (stripped.length === 32) {
-            return { ok: true, md5: stripped };
-        }
-        if (s.length === 32) {
-            const invalid = [];
-            for (const ch of s) {
-                if (!/[0-9a-f]/i.test(ch)) invalid.push(ch);
+    const baidu = {
+        isBaiduHost() {
+            return /^pan\.baidu\.com$/.test(location.hostname);
+        },
+
+        /**
+         * 解密百度网盘加密的 MD5。
+         * 百度加密流程：重组(swap前后8位块) → 逐位XOR(key=pos&15) → 第9位替换为 chr('g'+val)
+         * 解密为其逆过程（重组与XOR均自逆）。
+         * 若传入已是标准32位十六进制则原样返回。
+         */
+        decodeBaiduMd5(encrypted) {
+            const s = String(encrypted || "").trim();
+            if (!s || s.length !== 32) return s.toLowerCase();
+            // 已是标准32位十六进制MD5，无需解密
+            if (/^[0-9a-f]{32}$/i.test(s)) return s.toLowerCase();
+            // 加密后第9位（索引9）是 'g'~'v' 范围字符，代表 0~15 的偏移量
+            const specialChar = s.charAt(9);
+            const offset = specialChar.charCodeAt(0) - "g".charCodeAt(0);
+            if (offset < 0 || offset > 15) return s.toLowerCase();
+            // 恢复 r[9]：将特殊字符替换回对应十六进制字符
+            const r = s.toLowerCase().split("");
+            r[9] = offset.toString(16);
+            // 逆向XOR（XOR自逆）：i[o] = parseInt(r[o], 16) ^ (15 & o)
+            const dec = [];
+            for (let o = 0; o < 32; o++) {
+                const v = parseInt(r[o], 16);
+                if (isNaN(v)) return s.toLowerCase();
+                dec[o] = (v ^ (15 & o)).toString(16);
             }
-            const uniq = [...new Set(invalid)].join("");
-            return {
-                ok: false,
-                reason: `32个字符但含非十六进制符号「${uniq}」，MD5 只能由 0-9、a-f 组成（你当前 etag 不是标准 MD5）`,
+            // 逆向重组（与加密时相同，因为 swap 自逆）
+            const original =
+                dec.slice(8, 16).join("") +
+                dec.slice(0, 8).join("") +
+                dec.slice(24, 32).join("") +
+                dec.slice(16, 24).join("");
+            if (/^[0-9a-f]{32}$/.test(original)) return original;
+            return s.toLowerCase();
+        },
+
+        /** 从页面全局变量或 script 标签提取 bdstoken */
+        getBdstoken() {
+            try {
+                if (typeof unsafeWindow !== "undefined") {
+                    const yw = unsafeWindow.yunData;
+                    if (yw && yw.MYBDSTOKEN) return String(yw.MYBDSTOKEN);
+                }
+            } catch { /* ignore */ }
+            const scripts = document.querySelectorAll("script");
+            for (const s of scripts) {
+                const m = (s.textContent || "").match(/"bdstoken"\s*[=:]\s*"([a-f0-9]{32})"/i);
+                if (m) return m[1];
+            }
+            return "";
+        },
+
+        /** 从 React fiber / DOM / 全局变量获取选中文件/文件夹的 fs_id 列表 */
+        getSelectedFsIds() {
+            const ids = new Set();
+
+            // 方法1：扫描 React fiber 树，查找含 selectedList/checkedList 的组件 state/props
+            const scanFiber = (root, maxNodes) => {
+                if (!root) return;
+                const q = [root];
+                let n = 0;
+                while (q.length && n < maxNodes) {
+                    const cur = q.shift();
+                    n++;
+                    if (!cur) continue;
+                    // 检查 hooks memoizedState 链
+                    let hs = cur.memoizedState;
+                    while (hs) {
+                        const v = hs.memoizedState;
+                        if (v && typeof v === "object" && !Array.isArray(v)) {
+                            const list = v.selectedList || v.checkedList || v.selectedFiles || v.checkList;
+                            if (Array.isArray(list) && list.length) {
+                                list.forEach((f) => {
+                                    const id = String(f?.fs_id || f?.fsId || "");
+                                    if (/^\d+$/.test(id)) ids.add(id);
+                                });
+                            }
+                        }
+                        hs = hs.next;
+                    }
+                    // 检查 memoizedProps
+                    const mp = cur.memoizedProps;
+                    if (mp && typeof mp === "object") {
+                        const list = mp.selectedList || mp.checkedList || mp.selectedFiles;
+                        if (Array.isArray(list) && list.length) {
+                            list.forEach((f) => {
+                                const id = String(f?.fs_id || f?.fsId || "");
+                                if (/^\d+$/.test(id)) ids.add(id);
+                            });
+                        }
+                    }
+                    let ch = cur.child;
+                    while (ch) { q.push(ch); ch = ch.sibling; }
+                }
             };
+            const roots = [
+                document.getElementById("root"),
+                document.getElementById("app"),
+                document.querySelector("[id^='app']"),
+                document.body,
+            ].filter(Boolean);
+            for (const root of roots) {
+                const fk = Object.keys(root).find((k) =>
+                    k.startsWith("__reactFiber$") || k.startsWith("__reactInternalInstance$"),
+                );
+                if (fk) scanFiber(root[fk], 20000);
+                if (ids.size) break;
+            }
+            if (ids.size) return [...ids];
+
+            // 方法2：从选中 DOM 元素的 fiber props 提取 fs_id
+            const extractFsIdFromEl = (el) => {
+                const fk = Object.keys(el).find((k) =>
+                    k.startsWith("__reactFiber$") || k.startsWith("__reactInternalInstance$"),
+                );
+                if (!fk) return null;
+                let fiber = el[fk];
+                for (let i = 0; i < 25 && fiber; i++) {
+                    const mp = fiber.memoizedProps || fiber.pendingProps;
+                    if (mp && typeof mp === "object") {
+                        const item = mp.item || mp.file || mp.fileInfo || mp.data || mp.fileItem;
+                        if (item && typeof item === "object") {
+                            const id = String(item.fs_id || item.fsId || "");
+                            if (/^\d+$/.test(id)) return id;
+                        }
+                        const id = String(mp.fs_id || mp.fsId || "");
+                        if (/^\d+$/.test(id)) return id;
+                    }
+                    fiber = fiber.return;
+                }
+                return null;
+            };
+            document.querySelectorAll(
+                "[class*='selected']:not(head):not(style):not(script), [aria-selected='true']",
+            ).forEach((el) => {
+                if (el.tagName === "INPUT" || el.tagName === "BUTTON" || el.closest("thead")) return;
+                const id = extractFsIdFromEl(el);
+                if (id) ids.add(id);
+            });
+            if (ids.size) return [...ids];
+
+            // 方法3：Redux store / yunData 全局变量
+            try {
+                if (typeof unsafeWindow !== "undefined") {
+                    const stores = [
+                        unsafeWindow.__redux_store__,
+                        unsafeWindow.store,
+                        unsafeWindow.reduxStore,
+                    ];
+                    for (const store of stores) {
+                        if (!store || typeof store.getState !== "function") continue;
+                        const state = store.getState() || {};
+                        for (const key of Object.keys(state)) {
+                            const slice = state[key];
+                            if (!slice || typeof slice !== "object") continue;
+                            const list = slice.selectedList || slice.checkedList ||
+                                slice.selectedFiles || slice.selectedFsIds;
+                            if (!Array.isArray(list) || !list.length) continue;
+                            list.forEach((f) => {
+                                const id = typeof f === "object"
+                                    ? String(f?.fs_id || f?.fsId || f?.id || "")
+                                    : String(f);
+                                if (/^\d+$/.test(id)) ids.add(id);
+                            });
+                            if (ids.size) break;
+                        }
+                        if (ids.size) break;
+                    }
+                    if (!ids.size) {
+                        const yw = unsafeWindow.yunData;
+                        const sel = yw?.selectedFsIds;
+                        if (Array.isArray(sel)) sel.forEach((id) => ids.add(String(id)));
+                    }
+                }
+            } catch { /* ignore */ }
+
+            return [...ids];
+        },
+
+        /** 从 URL hash/search 获取当前目录路径 */
+        getCurrentDir() {
+            const src = location.hash + location.search;
+            const m = src.match(/[?&]path=([^&]+)/);
+            if (m) {
+                try { return decodeURIComponent(m[1]); } catch { return m[1]; }
+            }
+            return "/";
+        },
+
+        /** 从选中行的 title 属性或文本内容提取文件名 */
+        getSelectedFileNames() {
+            const names = new Set();
+            const candidates = [
+                ...document.querySelectorAll("[class*='selected']"),
+                ...document.querySelectorAll("[aria-selected='true']"),
+            ];
+            for (const el of candidates) {
+                if (el.tagName === "INPUT" || el.tagName === "BUTTON" || el.closest("thead")) continue;
+                // 优先子元素 title 属性（最稳定）
+                for (const te of el.querySelectorAll("[title]")) {
+                    const t = te.getAttribute("title") || "";
+                    if (t.length > 0 && t.length < 500 && !t.startsWith("http") && !t.includes("://")) {
+                        names.add(t);
+                        break;
+                    }
+                }
+                // 自身 title
+                const st = el.getAttribute("title") || "";
+                if (st.length > 0 && st.length < 500 && !st.startsWith("http") && !st.includes("://")) {
+                    names.add(st);
+                }
+            }
+            return [...names];
+        },
+
+        /** 递归列出目录下所有文件 */
+        async listDir(dir, pathPrefix) {
+            const files = [];
+            let page = 1;
+            const bdstoken = this.getBdstoken();
+            while (true) {
+                const url = "https://pan.baidu.com/api/list?" +
+                    `dir=${encodeURIComponent(dir)}&order=name&desc=0&showempty=0` +
+                    `&web=1&page=${page}&num=100&channel=chunlei&app_id=250528` +
+                    `&bdstoken=${encodeURIComponent(bdstoken)}`;
+                const text = await helper.get(url, { Referer: "https://pan.baidu.com/disk/main" });
+                const data = JSON.parse(text);
+                if (data.errno !== 0 || !Array.isArray(data.list)) break;
+                for (const item of data.list) {
+                    const itemPath = pathPrefix ? `${pathPrefix}/${item.server_filename}` : item.server_filename;
+                    if (item.isdir === 1) {
+                        files.push(...(await this.listDir(item.path, itemPath)));
+                    } else {
+                    files.push({
+                        fs_id: String(item.fs_id),
+                        path: itemPath,
+                        size: Number(item.size || 0),
+                        md5: this.decodeBaiduMd5(item.md5),
+                    });
+                    }
+                }
+                if (data.list.length < 100) break;
+                page++;
+                await helper.sleep(400);
+            }
+            return files;
+        },
+
+        /** 批量获取文件元数据（含 md5、path、isdir） */
+        async getFileMetas(fsIds) {
+            const result = {};
+            const bdstoken = this.getBdstoken();
+            const batchSize = 100;
+            for (let i = 0; i < fsIds.length; i += batchSize) {
+                const batch = fsIds.slice(i, i + batchSize);
+                const url = "https://pan.baidu.com/api/filemetas?" +
+                    `fsids=${encodeURIComponent(JSON.stringify(batch.map(Number)))}` +
+                    `&dlink=0&thumb=0&extra=0&needmedia=0&detail=1` +
+                    `&channel=chunlei&web=1&app_id=250528` +
+                    `&bdstoken=${encodeURIComponent(bdstoken)}`;
+                try {
+                    const text = await helper.get(url, { Referer: "https://pan.baidu.com/disk/main" });
+                    const data = JSON.parse(text);
+                    if (data.errno === 0 && Array.isArray(data.info)) {
+                        for (const item of data.info) {
+                        result[String(item.fs_id)] = {
+                            md5: this.decodeBaiduMd5(item.md5),
+                                path: String(item.path || ""),
+                                size: Number(item.size || 0),
+                                filename: String(item.filename || item.server_filename || ""),
+                                isdir: item.isdir === 1,
+                            };
+                        }
+                    }
+                } catch { /* ignore */ }
+                await helper.sleep(300);
+            }
+            return result;
+        },
+
+        async collectFiles() {
+            const output = [];
+            const folderItems = [];
+
+            // 方式一：fs_id（React fiber / Redux）
+            const fsIds = this.getSelectedFsIds();
+            if (fsIds.length) {
+                helper.updateLoadingMsg("正在获取文件信息...");
+                const metas = await this.getFileMetas(fsIds);
+                for (const id of fsIds) {
+                    const meta = metas[id];
+                    if (!meta) continue;
+                    if (meta.isdir) {
+                        folderItems.push({ baiduPath: meta.path, name: meta.filename });
+                    } else if (meta.md5) {
+                        output.push({ path: meta.filename || meta.path.split("/").pop(), etag: meta.md5, size: meta.size });
+                    }
+                }
+            }
+
+            // 方式二：DOM 文件名 + list API 匹配（兜底）
+            if (!output.length && !folderItems.length) {
+                const selectedNames = this.getSelectedFileNames();
+                if (!selectedNames.length) throw new Error("请先在百度网盘勾选要导出的文件或文件夹");
+                const currentDir = this.getCurrentDir();
+                helper.updateLoadingMsg("正在获取文件列表...");
+                const bdstoken = this.getBdstoken();
+                const url = "https://pan.baidu.com/api/list?" +
+                    `dir=${encodeURIComponent(currentDir)}&order=name&desc=0&showempty=0` +
+                    `&web=1&page=1&num=1000&channel=chunlei&app_id=250528` +
+                    `&bdstoken=${encodeURIComponent(bdstoken)}`;
+                const text = await helper.get(url, { Referer: "https://pan.baidu.com/disk/main" });
+                const data = JSON.parse(text);
+                if (data.errno !== 0 || !Array.isArray(data.list)) {
+                    throw new Error(`获取文件列表失败（errno=${data.errno}），请确认已登录百度网盘`);
+                }
+                const nameSet = new Set(selectedNames);
+                for (const item of data.list) {
+                    if (!nameSet.has(item.server_filename)) continue;
+                    if (item.isdir === 1) {
+                        folderItems.push({ baiduPath: item.path, name: item.server_filename });
+                    } else {
+                    output.push({
+                        path: item.server_filename,
+                        etag: this.decodeBaiduMd5(item.md5),
+                        size: Number(item.size || 0),
+                    });
+                    }
+                }
+                if (!output.length && !folderItems.length) {
+                    throw new Error(`已勾选 ${selectedNames.length} 个文件名，但在当前目录（${currentDir}）未匹配到对应文件，请确认当前目录与勾选文件一致`);
+                }
+            }
+
+            // 递归遍历文件夹
+            for (const folder of folderItems) {
+                helper.updateLoadingMsg(`正在扫描：${folder.name}...`);
+                const subFiles = await this.listDir(folder.baiduPath, folder.name);
+                for (const f of subFiles) {
+                    output.push({ path: f.path, etag: f.md5 || "", size: f.size });
+                }
+            }
+
+            if (!output.length) throw new Error("没有可导出的百度网盘文件");
+            return output;
+        },
+    };
+
+    /** 判断是否为文件名违禁词错误（光鸭 code=166），可安全跳过并继续下一个文件 */
+    function isGuangyaForbiddenNameError(err) {
+        if (!err) return false;
+        try {
+            const detail = JSON.parse(String(err.guangyaDetail || "{}"));
+            const rb = detail && detail.responseBody;
+            if (rb && typeof rb === "object" && rb.code === 166) return true;
+        } catch {
+            /* ignore */
         }
-        return {
-            ok: false,
-            reason: `去除分隔符等后仅 ${stripped.length} 位十六进制，需要凑满 32 位`,
-        };
+        return false;
     }
+
+function guangyaExtractMd5FromEtag(raw) {
+    const s = String(raw ?? "").trim();
+    if (!s) return { ok: false, reason: "etag/md5 为空" };
+    const lower = s.toLowerCase();
+    // 标准 32 位十六进制 MD5
+    if (/^[0-9a-f]{32}$/.test(lower)) {
+        return { ok: true, md5: lower };
+    }
+    // 尝试 Base64 / Base64url 解码（夸克等网盘返回 Base64 编码的 MD5）
+    const decoded = helper.decodeMd5(s);
+    if (decoded && /^[0-9a-f]{32}$/.test(decoded)) {
+        return { ok: true, md5: decoded };
+    }
+    // 去掉分隔符后恰好 32 位十六进制（如带连字符的 UUID 格式）
+    const stripped = lower.replace(/[^0-9a-f]/g, "");
+    if (stripped.length === 32) {
+        return { ok: true, md5: stripped };
+    }
+    // 32 位字符串但含非十六进制字符：透传给接口，由服务端决定是否有效
+    // 部分网盘（如 123pan）返回的 etag 使用非标准字母表，客户端无法转换，
+    // 直接透传可让已有有效 etag 的文件正常导入，无效的由接口返回失败。
+    if (s.length === 32 && /^[0-9a-zA-Z+/=_-]{32}$/.test(s)) {
+        return { ok: true, md5: lower };
+    }
+    if (s.length === 32) {
+        // 含特殊符号，仍透传，不在客户端硬拦截
+        return { ok: true, md5: lower };
+    }
+    return {
+        ok: false,
+        reason: `etag 长度 ${s.length} 位，去除分隔符后十六进制位数为 ${stripped.length}，无法识别为有效 MD5`,
+    };
+}
 
     const panGuangya = {
         isHost() {
@@ -3360,6 +3733,13 @@
                         pushFailRow(row);
                     }
                 } catch (apiErr) {
+                    if (isGuangyaForbiddenNameError(apiErr)) {
+                        // 文件名含违禁词，记录并跳过，继续导入剩余文件
+                        skip.push(
+                            `${row.filePath}：文件名含违禁词，已跳过（${String(apiErr.message || "").slice(0, 200)}）`,
+                        );
+                        continue;
+                    }
                     pushFailRow(row);
                     apiErr.partialTransferFailures = transferFailedEntries.slice();
                     apiErr.importFailedAtProbeIndex = fi + 1;
@@ -3417,6 +3797,8 @@
                     files = sh.files;
                     shareTitle = sh.title || "";
                 }
+            } else if (baidu.isBaiduHost()) {
+                files = await baidu.collectFiles();
             } else {
                 throw new Error("当前站点不支持");
             }
@@ -3880,7 +4262,17 @@
             "\"PingFang SC\",\"Hiragino Sans GB\",\"Microsoft YaHei\",sans-serif;";
         if (floating) {
             css +=
-                "position:fixed;left:24px;top:24px;z-index:2147483647;margin-right:0;box-shadow:0 6px 20px rgba(0,0,0,.2);";
+                "position:fixed;right:24px;top:24px;z-index:2147483647;margin-right:0;" +
+                "box-shadow:0 4px 18px rgba(255,152,0,.5),0 2px 8px rgba(0,0,0,.18);" +
+                "border-radius:10px;transition:box-shadow .2s,transform .15s,opacity .15s;";
+            btn.addEventListener("mouseenter", () => {
+                btn.style.setProperty("box-shadow", "0 6px 24px rgba(255,152,0,.7),0 3px 12px rgba(0,0,0,.22)", "important");
+                btn.style.setProperty("transform", "translateY(-1px)", "important");
+            });
+            btn.addEventListener("mouseleave", () => {
+                btn.style.removeProperty("box-shadow");
+                btn.style.removeProperty("transform");
+            });
         }
         btn.style.cssText = css;
         btn.style.setProperty("font-size", "18px", "important");
@@ -3955,6 +4347,11 @@
             const found = resolveTianyiContainer();
             if (!found) return;
             container = found;
+        } else if (baidu.isBaiduHost()) {
+            matchedHost = true;
+            // 挂到 html 元素，避免百度 SPA 替换 body 内容时按钮丢失导致重复创建
+            container = document.documentElement;
+            useFloating = true;
         }
         if (!matchedHost || !container) return;
 
@@ -3978,6 +4375,7 @@
             !location.hostname.includes("quark.cn") &&
             !location.hostname.includes("cloud.189.cn") &&
             !pan123.is123Host() &&
+            !baidu.isBaiduHost() &&
             !panGuangya.isHost()
         ) {
             return;
